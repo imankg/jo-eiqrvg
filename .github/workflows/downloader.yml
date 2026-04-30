@@ -26,11 +26,15 @@ jobs:
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
           -d text="📥 در حال دانلود فایل در سرور گیت‌هاب..."
 
-      - name: Setup Tools
+      - name: Setup Tools & Cookies
         run: |
           sudo apt-get update && sudo apt-get install -y p7zip-full
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
+          # ساخت فایل کوکی از سکرت گیت‌هاب
+          cat << 'EOF' > cookies.txt
+          ${{ secrets.YT_COOKIES }}
+          EOF
 
       - name: Download File
         run: |
@@ -38,12 +42,12 @@ jobs:
           CUSTOM_NAME="${{ github.event.inputs.custom_name }}"
           
           if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]]; then
-            yt-dlp -o "raw_dl.%(ext)s" "$URL"
+            # استفاده از کوکی برای یوتیوب
+            yt-dlp --cookies cookies.txt -o "raw_dl.%(ext)s" "$URL"
           else
             wget -O raw_dl.tmp "$URL"
           fi
           
-          # پیدا کردن فایل دانلود شده و تغییر نام
           DL_FILE=$(ls raw_dl.* | head -n 1)
           EXT="${DL_FILE##*.}"
           FINAL_NAME="${CUSTOM_NAME}.${EXT}"
@@ -54,7 +58,7 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="🔐 در حال پردازش و اعمال تنظیمات امنیتی..."
+          -d text="🔐 در حال اعمال تنظیمات و فشرده‌سازی..."
 
       - name: Encrypt if Password Provided
         run: |
