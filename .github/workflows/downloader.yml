@@ -1,0 +1,83 @@
+name: Cloud Downloader
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        required: true
+      chat_id:
+        required: true
+      message_id:
+        required: true
+      custom_name:
+        required: true
+      password:
+        required: false
+        default: 'none'
+
+jobs:
+  download-and-process:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Notify - Starting
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
+          -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
+          -d text="📥 در حال دانلود فایل در سرور گیت‌هاب..."
+
+      - name: Setup Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Download File
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          CUSTOM_NAME="${{ github.event.inputs.custom_name }}"
+          
+          if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]]; then
+            yt-dlp -o "raw_dl.%(ext)s" "$URL"
+          else
+            wget -O raw_dl.tmp "$URL"
+          fi
+          
+          # پیدا کردن فایل دانلود شده و تغییر نام
+          DL_FILE=$(ls raw_dl.* | head -n 1)
+          EXT="${DL_FILE##*.}"
+          FINAL_NAME="${CUSTOM_NAME}.${EXT}"
+          mv "$DL_FILE" "$FINAL_NAME"
+          echo "FILE_TO_UPLOAD=$FINAL_NAME" >> $GITHUB_ENV
+
+      - name: Notify - Processing
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
+          -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
+          -d text="🔐 در حال پردازش و اعمال تنظیمات امنیتی..."
+
+      - name: Encrypt if Password Provided
+        run: |
+          if [ "${{ github.event.inputs.password }}" != "none" ]; then
+            7z a -p"${{ github.event.inputs.password }}" -mhe=on "${{ env.FILE_TO_UPLOAD }}.7z" "${{ env.FILE_TO_UPLOAD }}"
+            echo "FILE_TO_UPLOAD=${{ env.FILE_TO_UPLOAD }}.7z" >> $GITHUB_ENV
+          fi
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.FILE_TO_UPLOAD }}
+          tag_name: "dl-${{ github.run_id }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify - Done
+        run: |
+          LINK="https://github.com/${{ github.repository }}/releases/download/dl-${{ github.run_id }}/${{ env.FILE_TO_UPLOAD }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
+          -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
+          -d text="✅ دانلود با موفقیت انجام شد!
+          
+          📦 نام فایل: ${{ env.FILE_TO_UPLOAD }}
+          🔗 لینک دانلود مستقیم:
+          $LINK"
