@@ -13,6 +13,13 @@ on:
       password:
         required: false
         default: 'none'
+      worker_url:
+        required: true
+      unlock_secret:
+        required: true
+      max_size:
+        required: true
+        default: '400'
 
 jobs:
   download-and-process:
@@ -24,47 +31,54 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="📥 در حال دانلود فایل در سرور گیت‌هاب..."
+          -d text="📥 در حال دانلود فایل(ها) در سرور...
+          (کیفیت ویدیوها حداکثر 480p و حجم محدود به ${{ github.event.inputs.max_size }} مگابایت تنظیم شده است)"
 
       - name: Setup Tools & Cookies
         run: |
           sudo apt-get update && sudo apt-get install -y p7zip-full
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
           sudo chmod a+rx /usr/local/bin/yt-dlp
-          # ساخت فایل کوکی از سکرت گیت‌هاب
           cat << 'EOF' > cookies.txt
           ${{ secrets.YT_COOKIES }}
           EOF
 
-      - name: Download File
+      - name: Download Multiple Files
         run: |
-          URL="${{ github.event.inputs.url }}"
           CUSTOM_NAME="${{ github.event.inputs.custom_name }}"
+          MAX_SIZE="${{ github.event.inputs.max_size }}"
+          mkdir -p "$CUSTOM_NAME"
+          cd "$CUSTOM_NAME"
           
-          if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]]; then
-            # استفاده از کوکی برای یوتیوب
-            yt-dlp --cookies cookies.txt -o "raw_dl.%(ext)s" "$URL"
-          else
-            wget -O raw_dl.tmp "$URL"
-          fi
-          
-          DL_FILE=$(ls raw_dl.* | head -n 1)
-          EXT="${DL_FILE##*.}"
-          FINAL_NAME="${CUSTOM_NAME}.${EXT}"
-          mv "$DL_FILE" "$FINAL_NAME"
-          echo "FILE_TO_UPLOAD=$FINAL_NAME" >> $GITHUB_ENV
+          IFS=',' read -ra URL_ARRAY <<< "${{ github.event.inputs.url }}"
+          COUNTER=1
+          for URL in "${URL_ARRAY[@]}"; do
+            URL=$(echo "$URL" | xargs)
+            if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]] || [[ "$URL" == *"twitter.com"* ]] || [[ "$URL" == *"instagram.com"* ]]; then
+              # قفل کردن روی 480p و محدود کردن حجم. اگر حجم 480p زیاد بود، به کیفیت‌های پایین‌تر شیفت می‌کند. اگر همه بزرگتر از حجم بودند، بدترین کیفیت ممکن را می‌گیرد تا ارور ندهد.
+              yt-dlp --cookies ../cookies.txt -S "res:480" -f "bv*[filesize_approx<=?${MAX_SIZE}M]+ba/b[filesize_approx<=?${MAX_SIZE}M]/wv*+ba/w" -o "dl_${COUNTER}_%(ext)s" "$URL"
+            else
+              wget -O "dl_${COUNTER}.tmp" "$URL" || true
+            fi
+            ((COUNTER++))
+          done
+          cd ..
+          echo "FOLDER_NAME=$CUSTOM_NAME" >> $GITHUB_ENV
 
       - name: Notify - Processing
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="🔐 در حال اعمال تنظیمات و فشرده‌سازی..."
+          -d text="🔐 در حال فشرده‌سازی و اعمال تنظیمات امنیتی..."
 
-      - name: Encrypt if Password Provided
+      - name: Compress and Encrypt
         run: |
           if [ "${{ github.event.inputs.password }}" != "none" ]; then
-            7z a -p"${{ github.event.inputs.password }}" -mhe=on "${{ env.FILE_TO_UPLOAD }}.7z" "${{ env.FILE_TO_UPLOAD }}"
-            echo "FILE_TO_UPLOAD=${{ env.FILE_TO_UPLOAD }}.7z" >> $GITHUB_ENV
+            7z a -p"${{ github.event.inputs.password }}" -mhe=on "${{ env.FOLDER_NAME }}.7z" "./${{ env.FOLDER_NAME }}/*"
+            echo "FILE_TO_UPLOAD=${{ env.FOLDER_NAME }}.7z" >> $GITHUB_ENV
+          else
+            7z a "${{ env.FOLDER_NAME }}.zip" "./${{ env.FOLDER_NAME }}/*"
+            echo "FILE_TO_UPLOAD=${{ env.FOLDER_NAME }}.zip" >> $GITHUB_ENV
           fi
 
       - name: Upload to Release
@@ -80,8 +94,15 @@ jobs:
           LINK="https://github.com/${{ github.repository }}/releases/download/dl-${{ github.run_id }}/${{ env.FILE_TO_UPLOAD }}"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="✅ دانلود با موفقیت انجام شد!
+          -d text="✅ عملیات با موفقیت انجام شد!
           
           📦 نام فایل: ${{ env.FILE_TO_UPLOAD }}
           🔗 لینک دانلود مستقیم:
           $LINK"
+
+      - name: Unlock User in Cloudflare
+        if: always()
+        run: |
+          curl -s -X POST "${{ github.event.inputs.worker_url }}" \
+          -H "Content-Type: application/json" \
+          -d '{"action":"unlock", "secret":"${{ github.event.inputs.unlock_secret }}", "chat_id":"${{ github.event.inputs.chat_id }}"}'
