@@ -20,6 +20,9 @@ on:
       max_size:
         required: true
         default: '400'
+      upload_target:
+        required: true
+        default: 'release' # می‌تواند code یا release باشد
 
 jobs:
   download-and-process:
@@ -27,18 +30,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v3 # برای دسترسی به سورس کد جهت پوش کردن در پوشه dl
+
       - name: Notify - Starting
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="📥 در حال دانلود فایل(ها) در سرور...
-          (کیفیت ویدیوها حداکثر 480p و حجم محدود به ${{ github.event.inputs.max_size }} مگابایت تنظیم شده است)"
+          -d text="📥 در حال دانلود فایل(ها) در سرور..."
 
       - name: Setup Tools & Cookies
         run: |
-          sudo apt-get update && sudo apt-get install -y p7zip-full
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
+          sudo apt-get update && sudo apt-get install -y p7zip-full nodejs python3-pip
+          sudo python3 -m pip install --break-system-packages -U --pre yt-dlp
           cat << 'EOF' > cookies.txt
           ${{ secrets.YT_COOKIES }}
           EOF
@@ -55,8 +58,11 @@ jobs:
           for URL in "${URL_ARRAY[@]}"; do
             URL=$(echo "$URL" | xargs)
             if [[ "$URL" == *"youtube.com"* ]] || [[ "$URL" == *"youtu.be"* ]] || [[ "$URL" == *"twitter.com"* ]] || [[ "$URL" == *"instagram.com"* ]]; then
-              # قفل کردن روی 480p و محدود کردن حجم. اگر حجم 480p زیاد بود، به کیفیت‌های پایین‌تر شیفت می‌کند. اگر همه بزرگتر از حجم بودند، بدترین کیفیت ممکن را می‌گیرد تا ارور ندهد.
-              yt-dlp --cookies ../cookies.txt -S "res:480" -f "bv*[filesize_approx<=?${MAX_SIZE}M]+ba/b[filesize_approx<=?${MAX_SIZE}M]/wv*+ba/w" -o "dl_${COUNTER}_%(ext)s" "$URL"
+              yt-dlp --cookies ../cookies.txt \
+              --extractor-args "youtube:player_client=android,web" \
+              -S "res:480" \
+              -f "bv*[filesize_approx<=?${MAX_SIZE}M]+ba/b[filesize_approx<=?${MAX_SIZE}M]/wv*+ba/w" \
+              -o "dl_${COUNTER}_%(ext)s" "$URL"
             else
               wget -O "dl_${COUNTER}.tmp" "$URL" || true
             fi
@@ -65,44 +71,65 @@ jobs:
           cd ..
           echo "FOLDER_NAME=$CUSTOM_NAME" >> $GITHUB_ENV
 
-      - name: Notify - Processing
+      - name: Compress and Encrypt (with split for Code)
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
-          -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="🔐 در حال فشرده‌سازی و اعمال تنظیمات امنیتی..."
-
-      - name: Compress and Encrypt
-        run: |
+          TARGET="${{ github.event.inputs.upload_target }}"
+          PASS_ARG=""
           if [ "${{ github.event.inputs.password }}" != "none" ]; then
-            7z a -p"${{ github.event.inputs.password }}" -mhe=on "${{ env.FOLDER_NAME }}.7z" "./${{ env.FOLDER_NAME }}/*"
-            echo "FILE_TO_UPLOAD=${{ env.FOLDER_NAME }}.7z" >> $GITHUB_ENV
+            PASS_ARG="-p${{ github.event.inputs.password }} -mhe=on"
+          fi
+          
+          if [ "$TARGET" == "code" ]; then
+            # تکه‌تکه کردن به پارت‌های 95 مگابایتی برای دور زدن لیمیت 100 مگ گیت‌هاب
+            7z a -v95m $PASS_ARG "${{ env.FOLDER_NAME }}.7z" "./${{ env.FOLDER_NAME }}/*"
+            PARTS_COUNT=$(ls ${{ env.FOLDER_NAME }}.7z* | wc -l)
+            echo "FILE_PATTERN=${{ env.FOLDER_NAME }}.7z*" >> $GITHUB_ENV
+            echo "PARTS=$PARTS_COUNT" >> $GITHUB_ENV
           else
-            7z a "${{ env.FOLDER_NAME }}.zip" "./${{ env.FOLDER_NAME }}/*"
-            echo "FILE_TO_UPLOAD=${{ env.FOLDER_NAME }}.zip" >> $GITHUB_ENV
+            # فشرده سازی عادی برای ریلیس
+            7z a $PASS_ARG "${{ env.FOLDER_NAME }}.7z" "./${{ env.FOLDER_NAME }}/*"
+            echo "FILE_PATTERN=${{ env.FOLDER_NAME }}.7z" >> $GITHUB_ENV
+            echo "PARTS=1" >> $GITHUB_ENV
           fi
 
       - name: Upload to Release
+        if: ${{ github.event.inputs.upload_target == 'release' }}
         uses: softprops/action-gh-release@v1
         with:
-          files: ${{ env.FILE_TO_UPLOAD }}
+          files: ${{ env.FILE_PATTERN }}
           tag_name: "dl-${{ github.run_id }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload to Code (Git Push)
+        if: ${{ github.event.inputs.upload_target == 'code' }}
+        run: |
+          mkdir -p dl
+          mv ${{ env.FILE_PATTERN }} dl/
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main
+          git add dl/*
+          git commit -m "Add files: ${{ env.FOLDER_NAME }} (${{ env.PARTS }} parts) [skip ci]"
+          git push
+
       - name: Notify - Done
         run: |
-          LINK="https://github.com/${{ github.repository }}/releases/download/dl-${{ github.run_id }}/${{ env.FILE_TO_UPLOAD }}"
+          if [ "${{ github.event.inputs.upload_target }}" == "release" ]; then
+            LINK="https://github.com/${{ github.repository }}/releases/download/dl-${{ github.run_id }}/${{ env.FILE_PATTERN }}"
+            MSG="✅ فایل در Release آپلود شد.\n🔗 لینک: $LINK"
+          else
+            LINK="https://github.com/${{ github.repository }}/tree/main/dl"
+            MSG="✅ فایل در پوشه کد (dl) در ${NUMBER_OF_PARTS} پارت آپلود شد.\n🔗 لینک پوشه: $LINK"
+          fi
+          
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}/editMessageText" \
           -d chat_id="${{ github.event.inputs.chat_id }}" -d message_id="${{ github.event.inputs.message_id }}" \
-          -d text="✅ عملیات با موفقیت انجام شد!
-          
-          📦 نام فایل: ${{ env.FILE_TO_UPLOAD }}
-          🔗 لینک دانلود مستقیم:
-          $LINK"
+          -d text="$MSG"
 
-      - name: Unlock User in Cloudflare
+      - name: Unlock User & Update Final Cost
         if: always()
         run: |
           curl -s -X POST "${{ github.event.inputs.worker_url }}" \
           -H "Content-Type: application/json" \
-          -d '{"action":"unlock", "secret":"${{ github.event.inputs.unlock_secret }}", "chat_id":"${{ github.event.inputs.chat_id }}"}'
+          -d '{"action":"unlock", "secret":"${{ github.event.inputs.unlock_secret }}", "chat_id":"${{ github.event.inputs.chat_id }}", "parts":"${{ env.PARTS }}"}'
